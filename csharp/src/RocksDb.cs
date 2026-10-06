@@ -5,7 +5,11 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using Transitional;
+#if !NETSTANDARD2_0
+using System.Buffers;
+#endif
 
 namespace RocksDbSharp
 {
@@ -18,6 +22,7 @@ namespace RocksDbSharp
         internal static WriteOptions DefaultWriteOptions { get; } = new WriteOptions();
         internal static Encoding DefaultEncoding => Encoding.UTF8;
         private Dictionary<string, ColumnFamilyHandleInternal> columnFamilies;
+        private ColumnFamilyHandleInternal defaultColumnFamilyHandle;
 
         // Managed references to unmanaged resources that need to live at least as long as the db
         internal dynamic References { get; } = new ExpandoObject();
@@ -65,6 +70,9 @@ namespace RocksDbSharp
                 }
                 columnFamilies = null;
             }
+
+            defaultColumnFamilyHandle?.Dispose();
+            defaultColumnFamilyHandle = null;
 
             if(Handle != IntPtr.Zero)
             {
@@ -340,6 +348,197 @@ namespace RocksDbSharp
         {
             return Native.Instance.rocksdb_multi_get(Handle, (readOptions ?? DefaultReadOptions).Handle, keys, cf);
         }
+
+#if !NETSTANDARD2_0
+        // Batches up to this size keep their key slices and value pointers on the stack (16 + 8 bytes per key).
+        private const int MultiGetStackLimit = 128;
+
+        /// <summary>
+        /// Looks up a batch of keys in one column family with one batched RocksDB MultiGet, and hands each value
+        /// that exists to <paramref name="visitor"/> as a span over RocksDB's own memory. No value is copied: each
+        /// one stays pinned (usually in the block cache) until every visitor call returns. The batched lookup groups
+        /// the filter and index checks of each table file, and where the native library has io_uring it reads the
+        /// data blocks of a file in parallel.
+        /// </summary>
+        /// <param name="packedKeys">All the keys, one after the other.</param>
+        /// <param name="keyLengths">The length of each key in <paramref name="packedKeys"/>; their sum must equal its length.</param>
+        /// <param name="visitor">Receives each value that exists; see <see cref="IMultiGetValueVisitor"/>.</param>
+        /// <param name="cf">The column family of every key, or null for the default column family.</param>
+        /// <param name="readOptions">The read options, or null for the defaults.</param>
+        /// <param name="sortedInput">
+        /// True only when the keys are already in the column family's comparator order, so RocksDB does not sort them.
+        /// </param>
+        /// <exception cref="RocksDbException">
+        /// A key failed with an error other than not-found. No visitor call is made in that case.
+        /// </exception>
+        public unsafe void MultiGet<TVisitor>(
+            ReadOnlySpan<byte> packedKeys,
+            ReadOnlySpan<int> keyLengths,
+            ref TVisitor visitor,
+            ColumnFamilyHandle cf = null,
+            ReadOptions readOptions = null,
+            bool sortedInput = false)
+            where TVisitor : struct, IMultiGetValueVisitor
+        {
+            int count = keyLengths.Length;
+            if (count == 0)
+            {
+                return;
+            }
+
+            long totalLength = 0;
+            for (int i = 0; i < count; i++)
+            {
+                if (keyLengths[i] < 0)
+                {
+                    throw new ArgumentException($"Key length at index {i} is negative ({keyLengths[i]}).", nameof(keyLengths));
+                }
+
+                totalLength += keyLengths[i];
+            }
+
+            if (totalLength != packedKeys.Length)
+            {
+                throw new ArgumentException(
+                    $"The key lengths add up to {totalLength} bytes, but the packed keys hold {packedKeys.Length} bytes.",
+                    nameof(keyLengths));
+            }
+
+            IntPtr cfHandle = (cf ?? GetDefaultColumnFamilyHandle()).Handle;
+            IntPtr readOptionsHandle = (readOptions ?? DefaultReadOptions).Handle;
+
+            NativeSlice[] rentedSlices = null;
+            IntPtr[] rentedValues = null;
+            Span<NativeSlice> slices = count <= MultiGetStackLimit
+                ? stackalloc NativeSlice[count]
+                : (rentedSlices = ArrayPool<NativeSlice>.Shared.Rent(count)).AsSpan(0, count);
+            Span<IntPtr> values = count <= MultiGetStackLimit
+                ? stackalloc IntPtr[count]
+                : (rentedValues = ArrayPool<IntPtr>.Shared.Rent(count)).AsSpan(0, count);
+
+            // The binding takes the error array as a managed array; the native call fills its first count entries.
+            IntPtr[] errs = ArrayPool<IntPtr>.Shared.Rent(count);
+            bool called = false;
+
+            try
+            {
+                fixed (byte* keyBase = packedKeys)
+                fixed (NativeSlice* slicePtr = slices)
+                fixed (IntPtr* valuePtr = values)
+                {
+                    int offset = 0;
+                    for (int i = 0; i < count; i++)
+                    {
+                        slices[i] = new NativeSlice((IntPtr)(keyBase + offset), (UIntPtr)(uint)keyLengths[i]);
+                        offset += keyLengths[i];
+                    }
+
+                    Native.Instance.rocksdb_batched_multi_get_cf_slice(
+                        Handle,
+                        readOptionsHandle,
+                        cfHandle,
+                        (UIntPtr)(uint)count,
+                        (IntPtr)slicePtr,
+                        (IntPtr)valuePtr,
+                        errs,
+                        sortedInput ? (byte)1 : (byte)0);
+
+                    // Only now does every entry of values and errs belong to this call: a rented array can hold
+                    // stale pointers until the native call writes it.
+                    called = true;
+                }
+
+                for (int i = 0; i < count; i++)
+                {
+                    IntPtr error = errs[i];
+                    if (error != IntPtr.Zero)
+                    {
+                        // The exception frees the error string; the finally block frees the rest.
+                        errs[i] = IntPtr.Zero;
+                        throw new RocksDbException(error);
+                    }
+                }
+
+                for (int i = 0; i < count; i++)
+                {
+                    IntPtr value = values[i];
+                    if (value == IntPtr.Zero)
+                    {
+                        continue;
+                    }
+
+                    IntPtr data = Native.Instance.rocksdb_pinnableslice_value(value, out UIntPtr length);
+                    visitor.OnValue(i, new ReadOnlySpan<byte>((void*)data, checked((int)(ulong)length)));
+                }
+            }
+            finally
+            {
+                if (called)
+                {
+                    for (int i = 0; i < count; i++)
+                    {
+                        if (values[i] != IntPtr.Zero)
+                        {
+                            Native.Instance.rocksdb_pinnableslice_destroy(values[i]);
+                        }
+
+                        if (errs[i] != IntPtr.Zero)
+                        {
+                            Native.Instance.rocksdb_free(errs[i]);
+                        }
+                    }
+                }
+
+                ArrayPool<IntPtr>.Shared.Return(errs);
+                if (rentedValues is object)
+                {
+                    ArrayPool<IntPtr>.Shared.Return(rentedValues);
+                }
+
+                if (rentedSlices is object)
+                {
+                    ArrayPool<NativeSlice>.Shared.Return(rentedSlices);
+                }
+            }
+        }
+
+        /// <summary>
+        /// The default column family handle, created once on first use. Unlike <see cref="GetDefaultColumnFamily"/>
+        /// it also works on a database that was opened without column families.
+        /// </summary>
+        private ColumnFamilyHandle GetDefaultColumnFamilyHandle()
+        {
+            ColumnFamilyHandleInternal handle = Volatile.Read(ref defaultColumnFamilyHandle);
+            if (handle is object)
+            {
+                return handle;
+            }
+
+            var created = new ColumnFamilyHandleInternal(Native.Instance.rocksdb_get_default_column_family_handle(Handle));
+            ColumnFamilyHandleInternal existing = Interlocked.CompareExchange(ref defaultColumnFamilyHandle, created, null);
+            if (existing is object)
+            {
+                created.Dispose();
+                return existing;
+            }
+
+            return created;
+        }
+
+        /// <summary>The layout of rocksdb_slice_t (and of rocksdb::Slice): a data pointer and a size.</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        private readonly struct NativeSlice
+        {
+            public readonly IntPtr Data;
+            public readonly UIntPtr Size;
+
+            public NativeSlice(IntPtr data, UIntPtr size)
+            {
+                Data = data;
+                Size = size;
+            }
+        }
+#endif
 
         public void Write(WriteBatch writeBatch, WriteOptions writeOptions = null)
         {
