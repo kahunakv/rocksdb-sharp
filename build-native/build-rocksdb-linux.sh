@@ -3,7 +3,7 @@
 # Builds the rocksdb shared library for Linux.
 #
 # Usage: ./build-rocksdb-linux.sh [--arch x64|arm64] [--libc glibc|musl]
-#                                 [--no-jemalloc]
+#                                 [--no-jemalloc] [--no-io-uring]
 #
 # Outputs, under build-native/runtimes/linux-<arch>/native/:
 #
@@ -14,9 +14,12 @@
 # --no-jemalloc skips the jemalloc flavour, for targets where no jemalloc for
 # the target architecture is available to link against.
 #
-# zlib, bzip2, snappy, lz4 and zstd are compiled from source and linked in
-# statically, so the published library only depends on the system C/C++
-# runtime. Build the musl flavour by running this script inside an Alpine
+# --no-io-uring builds without io_uring support (see rocksdb-sharp-io-uring.cc
+# for what it does and how it is switched off at runtime instead).
+#
+# zlib, bzip2, snappy, lz4, zstd and liburing are compiled from source and
+# linked in statically, so the published library only depends on the system
+# C/C++ runtime. Build the musl flavour by running this script inside an Alpine
 # container; build linux-arm64 either on an arm64 machine or on x64 with the
 # aarch64-linux-gnu cross toolchain installed.
 #
@@ -30,13 +33,15 @@ set -u
 TARGET_ARCH=""
 TARGET_LIBC=""
 WITH_JEMALLOC=yes
+WITH_IO_URING=yes
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --arch) TARGET_ARCH="${2:-}"; shift 2 ;;
         --libc) TARGET_LIBC="${2:-}"; shift 2 ;;
         --no-jemalloc) WITH_JEMALLOC=no; shift ;;
-        -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+        --no-io-uring) WITH_IO_URING=no; shift ;;
+        -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
         *) fail "unknown argument: $1" ;;
     esac
 done
@@ -159,6 +164,85 @@ for archive in $COMPRESSION_LDFLAGS; do
 done
 
 # ---------------------------------------------------------------------------
+# io_uring
+# ---------------------------------------------------------------------------
+
+# rocksdb pins a version for each compression library but not for liburing --
+# it only probes for one installed on the build machine -- so it is pinned here.
+LIBURING_VER="2.15"
+LIBURING_SHA256="8d052f2622dcb3678cbaee5ff582a87572672a6c0a56533cdda5b65cb636120a"
+
+# build_detect_platform links -luring whenever it finds liburing on the build
+# machine, which would leave the library needing liburing.so.2 at runtime. The
+# static archive below is the only way liburing gets in.
+export ROCKSDB_USE_IO_URING=0
+
+IO_URING_CPPFLAGS=""
+IO_URING_LDFLAGS=""
+
+# Builds liburing as a static PIC archive, plus the object that defines
+# RocksDbIOUringEnable, and sets IO_URING_CPPFLAGS/IO_URING_LDFLAGS to add both
+# to the rocksdb build.
+build_static_liburing() {
+    local tarball="liburing-${LIBURING_VER}.tar.gz"
+
+    fetch_dependency "$tarball" "$LIBURING_SHA256" \
+        "https://github.com/axboe/liburing/archive/refs/tags/liburing-${LIBURING_VER}.tar.gz"
+
+    # Unpacked afresh every time: configure records the compiler it was given,
+    # and one rocksdb tree can be shared by builds for several architectures.
+    local srcdir="${ROCKSDB_SRC_DIR}/liburing-liburing-${LIBURING_VER}"
+    rm -rf "$srcdir"
+    tar -xzf "${ROCKSDB_SRC_DIR}/${tarball}" -C "$ROCKSDB_SRC_DIR" \
+        || fail "unable to unpack ${tarball}"
+
+    info "building static liburing ${LIBURING_VER}"
+
+    # The static objects are compiled without -fPIC by default, since they are
+    # meant for executables; LIBURING_CFLAGS is appended to every compile.
+    #
+    # On x86_64 and aarch64 configure picks liburing's nolibc mode, where it
+    # makes its system calls directly and references nothing from the C
+    # library, so it can neither raise the glibc floor nor behave differently
+    # under musl.
+    (cd "$srcdir" && {
+        ./configure --cc="${CC:-gcc}" --cxx="${CXX:-g++}" > /dev/null \
+            || fail "liburing configure failed"
+        make -C src -j"${CONCURRENCY}" liburing.a LIBURING_CFLAGS=-fPIC \
+            || fail "liburing build failed"
+    }) || exit 1
+
+    cp -f "${srcdir}/src/liburing.a" "${DEPS_DIR}/" || fail "unable to stage liburing.a"
+
+    "${CXX:-g++}" -std=c++20 -O2 -fPIC -Wall -Werror \
+        -c "${BUILD_NATIVE_DIR}/rocksdb-sharp-io-uring.cc" \
+        -o "${DEPS_DIR}/rocksdb-sharp-io-uring.o" \
+        || fail "unable to compile rocksdb-sharp-io-uring.cc"
+
+    verify_archives_match_compiler "${CXX:-g++}" \
+        "${DEPS_DIR}/liburing.a" "${DEPS_DIR}/rocksdb-sharp-io-uring.o"
+
+    IO_URING_CPPFLAGS="-DROCKSDB_IOURING_PRESENT -I${srcdir}/src/include"
+
+    # The hook goes in as an object file rather than an archive member: rocksdb
+    # only references RocksDbIOUringEnable weakly, and a weak reference never
+    # pulls a member out of an archive, so it would be silently left out.
+    #
+    # --exclude-libs keeps liburing's own functions out of the library's
+    # exports. Unlike the compression libraries, liburing is something another
+    # library in the same process may well bring along as liburing.so.2, and an
+    # unversioned io_uring_queue_init exported from here could be bound in its
+    # place.
+    IO_URING_LDFLAGS="${DEPS_DIR}/rocksdb-sharp-io-uring.o ${DEPS_DIR}/liburing.a -Wl,--exclude-libs,liburing.a"
+}
+
+if [ "$WITH_IO_URING" = "yes" ]; then
+    build_static_liburing
+else
+    info "building without io_uring"
+fi
+
+# ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
 
@@ -182,9 +266,9 @@ build_shared_lib() {
         # target machine's libstdc++ does not have to be as new as the build
         # machine's.
         make -j"${CONCURRENCY}" shared_lib \
-            EXTRA_CXXFLAGS="-static-libstdc++ ${COMPRESSION_CPPFLAGS}" \
+            EXTRA_CXXFLAGS="-static-libstdc++ ${COMPRESSION_CPPFLAGS} ${IO_URING_CPPFLAGS}" \
             EXTRA_CFLAGS="${COMPRESSION_CPPFLAGS}" \
-            EXTRA_LDFLAGS="-static-libstdc++ ${STATIC_DEPS} ${extra_ldflags}" \
+            EXTRA_LDFLAGS="-static-libstdc++ ${STATIC_DEPS} ${IO_URING_LDFLAGS} ${extra_ldflags}" \
             ${extra_make_vars} || fail "${label} build failed"
 
         "$STRIP" librocksdb.so || warn "unable to strip ${label}"
@@ -211,6 +295,32 @@ BASE_DEPENDENCIES="libc.so.6 libm.so.6 libdl.so.2 librt.so.1 libpthread.so.0 lib
 # between the two honest.
 GLIBC_FLOOR="2.34"
 
+# Fail unless io_uring support really made it into the library.
+#
+# The two halves are checked separately because either can go missing on its
+# own: without -DROCKSDB_IOURING_PRESENT rocksdb compiles none of its io_uring
+# code and the hook is dead weight, and without the hook rocksdb has the code
+# but never runs it.
+verify_io_uring() {
+    local lib="$1"
+
+    # The only trace -DROCKSDB_IOURING_PRESENT leaves in a stripped library.
+    LC_ALL=C grep -q -a "CreateIOUring failed" "$lib" \
+        || fail "$(basename "$lib") was built without rocksdb's io_uring code"
+
+    local symbols
+    symbols="$(nm -D --defined-only "$lib")" || fail "unable to list symbols of ${lib}"
+
+    grep -qE ' RocksDbIOUringEnable$' <<< "$symbols" \
+        || fail "$(basename "$lib") does not define RocksDbIOUringEnable, so rocksdb would never use io_uring"
+
+    if grep -qE ' io_uring_' <<< "$symbols"; then
+        fail "$(basename "$lib") exports liburing's functions, which --exclude-libs should have hidden"
+    fi
+
+    info "$(basename "$lib") uses io_uring where the kernel allows it"
+}
+
 # Checks the library just built, before it is published under its final name.
 check_library() {
     local label="$1"
@@ -221,6 +331,10 @@ check_library() {
     verify_library "${ROCKSDB_SRC_DIR}/librocksdb.so" $COMPRESSION_SYMBOLS "$@"
     verify_dependencies "${ROCKSDB_SRC_DIR}/librocksdb.so" "${CROSS_PREFIX}readelf" \
         $BASE_DEPENDENCIES
+
+    if [ "$WITH_IO_URING" = "yes" ]; then
+        verify_io_uring "${ROCKSDB_SRC_DIR}/librocksdb.so"
+    fi
 
     # musl does not version its symbols, and ships one library for every
     # release, so there is no equivalent floor to check there.
@@ -286,6 +400,10 @@ if [ "$TARGET_LIBC" = "glibc" ] && [ "$WITH_JEMALLOC" = "yes" ]; then
 
     verify_glibc_floor "${ROCKSDB_SRC_DIR}/librocksdb.so" "${CROSS_PREFIX}readelf" \
         "$GLIBC_FLOOR"
+
+    if [ "$WITH_IO_URING" = "yes" ]; then
+        verify_io_uring "${ROCKSDB_SRC_DIR}/librocksdb.so"
+    fi
 
     "${CROSS_PREFIX}readelf" -d "${ROCKSDB_SRC_DIR}/librocksdb.so" \
         | grep -q "libjemalloc" \

@@ -23,8 +23,8 @@ when packing.
 
 ## Self-contained artifacts
 
-zlib, bzip2, snappy, lz4 and zstd are compiled from source as static archives
-and linked into the RocksDB library — on Windows they come from vcpkg's
+zlib, bzip2, snappy, lz4 and zstd (plus liburing on Linux) are compiled from
+source as static archives and linked into the RocksDB library — on Windows they come from vcpkg's
 `x64-windows-static` triplet instead. The C++ runtime is linked statically too
 (`-static-libstdc++` on Linux, `/MT` on Windows).
 
@@ -48,6 +48,7 @@ the SHA-256 RocksDB declares for it.
 
 ```
 ./build-rocksdb-linux.sh [--arch x64|arm64] [--libc glibc|musl] [--no-jemalloc]
+                         [--no-io-uring]
 ```
 
 Defaults to the architecture and libc of the machine it runs on. Requires
@@ -86,6 +87,38 @@ which cannot be satisfied by a library `dlopen`ed after startup.
 Where jemalloc is absent, the library simply does not load and RocksDbSharp
 falls through to `librocksdb.so` — which is why the plain library must never
 depend on jemalloc itself.
+
+### io_uring
+
+Every Linux library is built with RocksDB's io_uring support, against a static
+liburing compiled from source. RocksDB pins no liburing version of its own, so
+the version and its SHA-256 are pinned in `build-rocksdb-linux.sh`. RocksDB's
+own probe for a system liburing is turned off (`ROCKSDB_USE_IO_URING=0`), since
+it would link `liburing.so.2` dynamically. liburing's functions are kept out of
+the library's exports with `--exclude-libs`, so they cannot be bound in place of
+another copy of liburing loaded in the same process.
+
+Compiling the support in is only half of it: RocksDB only uses io_uring when the
+process defines `RocksDbIOUringEnable()` and it returns true, and upstream only
+defines it in its tests and `db_bench`. `rocksdb-sharp-io-uring.cc` supplies it.
+`ROCKSDB_SHARP_DISABLE_IO_URING=1` in the environment the process starts with
+turns it off. .NET's `Environment.SetEnvironmentVariable` does not reach the
+native environment, so setting it from managed code has no effect.
+
+Whether the kernel allows io_uring is left to RocksDB: `PosixFileSystem` sets up
+one ring with the flags it uses everywhere (`IORING_SETUP_SINGLE_ISSUER |
+IORING_SETUP_DEFER_TASKRUN`, Linux 6.1 or newer) and, if that fails, stays on
+plain `pread` for the life of the process. Older kernels, Docker's default
+seccomp profile and `kernel.io_uring_disabled` all end up there. RocksDB prints
+one `CreateIOUring failed: ...` line to stdout when that happens; it is
+harmless, and only goes away by allowing io_uring (for Docker,
+`--security-opt seccomp=unconfined` or a profile that permits the
+`io_uring_*` syscalls).
+
+With io_uring enabled, `MultiGet` reads the blocks it needs from one SST file in
+parallel instead of one after another, and iterators read ahead asynchronously
+when `ReadOptions.SetAsyncIO(true)` is set. Point lookups through `Get` and all
+writes are unaffected. `--no-io-uring` builds without any of it.
 
 Cross compiling to `arm64` needs `g++-aarch64-linux-gnu` on `PATH`. Exporting
 `CC` is not enough to carry that through to every dependency — bzip2's makefile
