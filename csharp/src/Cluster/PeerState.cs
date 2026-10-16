@@ -19,6 +19,7 @@ public sealed class PeerState
     private long _nextSeq;
     private long _lastSuccessfulContactTicks;
     private int _reachable; // 1/0
+    private int _heartbeatInFlight; // 1/0
 
     public PeerState(ClusterMember member, ulong initialNextSeq)
     {
@@ -54,6 +55,16 @@ public sealed class PeerState
         Interlocked.Exchange(ref _lastSuccessfulContactTicks, DateTime.UtcNow.Ticks);
         Volatile.Write(ref _reachable, 1);
     }
+
+    /// <summary>
+    /// Claims the heartbeat slot of this peer. The leader sends a new
+    /// heartbeat only when the previous one finished, so a slow peer cannot
+    /// pile up one pending request per heartbeat interval.
+    /// </summary>
+    internal bool TryBeginHeartbeat() => Interlocked.CompareExchange(ref _heartbeatInFlight, 1, 0) == 0;
+
+    /// <summary>Releases the slot that <see cref="TryBeginHeartbeat"/> claimed.</summary>
+    internal void EndHeartbeat() => Volatile.Write(ref _heartbeatInFlight, 0);
 
     public void RewindOnConflict(ulong newNextSeq)
     {

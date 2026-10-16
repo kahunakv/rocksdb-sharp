@@ -236,6 +236,19 @@ public class ClusterBatchData
     /// </summary>
     [Key(4)] public long EntryTerm { get; set; }
     [Key(5)] public byte[] PooledData { get; set; } = Array.Empty<byte>();
+    /// <summary>
+    /// How many WAL entries the message holds. The leader streams chunks of
+    /// consecutive write batches merged into one, so a message covers the
+    /// sequence numbers SequenceNumber .. SequenceNumber + EntryCount - 1.
+    /// </summary>
+    [Key(6)] public int EntryCount { get; set; }
+    /// <summary>
+    /// The terms that start inside the message, after its first entry (whose
+    /// term is <see cref="EntryTerm"/>), as (first sequence number, term)
+    /// pairs in ascending order. Usually empty: a term only starts once per
+    /// leadership.
+    /// </summary>
+    [Key(7)] public (ulong StartSeq, long Term)[] TermChanges { get; set; } = Array.Empty<(ulong, long)>();
 
     [IgnoreMember] public ReadOnlySpan<byte> Data => PooledData.AsSpan(0, Length);
 
@@ -256,6 +269,17 @@ public class PooledClusterBatchDataSerializer : IMessagePackFormatter<ClusterBat
         d.LeaderTerm = reader.ReadInt64();
         d.LeaderId = reader.ReadString() ?? "";
         d.EntryTerm = reader.ReadInt64();
+        d.EntryCount = reader.ReadInt32();
+        int changes = reader.ReadArrayHeader();
+        if (changes > 0)
+        {
+            var termChanges = new (ulong, long)[changes];
+            for (int i = 0; i < changes; i++)
+            {
+                termChanges[i] = (reader.ReadUInt64(), reader.ReadInt64());
+            }
+            d.TermChanges = termChanges;
+        }
         var pooled = ArrayPool<byte>.Shared.Rent(Math.Max(1, d.Length));
         var raw = reader.ReadRaw(d.Length);
         raw.CopyTo(pooled.AsSpan(0, d.Length));
@@ -270,6 +294,13 @@ public class PooledClusterBatchDataSerializer : IMessagePackFormatter<ClusterBat
         writer.WriteInt64(value.LeaderTerm);
         writer.Write(value.LeaderId);
         writer.WriteInt64(value.EntryTerm);
+        writer.WriteInt32(value.EntryCount);
+        writer.WriteArrayHeader(value.TermChanges.Length);
+        foreach (var (startSeq, term) in value.TermChanges)
+        {
+            writer.WriteUInt64(startSeq);
+            writer.WriteInt64(term);
+        }
         writer.WriteRaw(value.PooledData.AsSpan(0, value.Length));
     }
 }

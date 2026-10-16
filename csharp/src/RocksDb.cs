@@ -324,28 +324,28 @@ namespace RocksDbSharp
         /// <returns>The actual length of the database field if it exists, otherwise -1</returns>
         public long Get(byte[] key, long keyLength, byte[] buffer, long offset, long length, ColumnFamilyHandle cf = null, ReadOptions readOptions = null)
         {
-            unsafe
-            {
-                var ptr = Native.Instance.rocksdb_get(Handle, (readOptions ?? DefaultReadOptions).Handle, key, keyLength, out long valLength, cf);
-                if (ptr == IntPtr.Zero)
-                {
-                    return -1;
-                }
-
-                var copyLength = Math.Min(length, valLength);
-                Marshal.Copy(ptr, buffer, (int)offset, (int)copyLength);
-                Native.Instance.rocksdb_free(ptr);
-                return valLength;
-            }
+            return Native.Instance.rocksdb_get_into(Handle, (readOptions ?? DefaultReadOptions).Handle, key, keyLength, buffer, offset, length, cf);
         }
 
         public KeyValuePair<byte[],byte[]>[] MultiGet(byte[][] keys, ColumnFamilyHandle[] cf = null, ReadOptions readOptions = null)
         {
+#if !NETSTANDARD2_0
+            if (TryGetSingleColumnFamily(keys.Length, cf, out ColumnFamilyHandle family))
+            {
+                return MultiGetBatched(keys, family, readOptions);
+            }
+#endif
             return Native.Instance.rocksdb_multi_get(Handle, (readOptions ?? DefaultReadOptions).Handle, keys, null, cf);
         }
 
         public KeyValuePair<string, string>[] MultiGet(string[] keys, ColumnFamilyHandle[] cf = null, ReadOptions readOptions = null)
         {
+#if !NETSTANDARD2_0
+            if (TryGetSingleColumnFamily(keys.Length, cf, out ColumnFamilyHandle family))
+            {
+                return MultiGetBatched(keys, family, readOptions, DefaultEncoding);
+            }
+#endif
             return Native.Instance.rocksdb_multi_get(Handle, (readOptions ?? DefaultReadOptions).Handle, keys, cf);
         }
 
@@ -500,6 +500,158 @@ namespace RocksDbSharp
                     ArrayPool<NativeSlice>.Shared.Return(rentedSlices);
                 }
             }
+        }
+
+        /// <summary>
+        /// True when every key of an array MultiGet reads the same column family, so the batched API applies.
+        /// <paramref name="family"/> is null for the default column family. A column family array with a length
+        /// other than the key count keeps the old path, and with it the old behavior for that input.
+        /// </summary>
+        private static bool TryGetSingleColumnFamily(int keyCount, ColumnFamilyHandle[] cf, out ColumnFamilyHandle family)
+        {
+            family = null;
+            if (cf is null)
+            {
+                return true;
+            }
+
+            if (cf.Length != keyCount || keyCount == 0)
+            {
+                return false;
+            }
+
+            family = cf[0];
+            for (int i = 1; i < cf.Length; i++)
+            {
+                if (cf[i] is null || family is null || cf[i].Handle != family.Handle)
+                {
+                    return false;
+                }
+            }
+
+            return family is object;
+        }
+
+        /// <summary>
+        /// The array MultiGet on top of <see cref="MultiGet{TVisitor}"/>: values come from pinnable slices, so each one
+        /// is copied once, into its result array, instead of first into a malloc()ed buffer.
+        /// </summary>
+        private KeyValuePair<byte[], byte[]>[] MultiGetBatched(byte[][] keys, ColumnFamilyHandle cf, ReadOptions readOptions)
+        {
+            int count = keys.Length;
+            var results = new KeyValuePair<byte[], byte[]>[count];
+            if (count == 0)
+            {
+                return results;
+            }
+
+            int[] lengths = ArrayPool<int>.Shared.Rent(count);
+            byte[] packed = null;
+            try
+            {
+                int totalLength = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    lengths[i] = keys[i].Length;
+                    totalLength = checked(totalLength + lengths[i]);
+                    results[i] = new KeyValuePair<byte[], byte[]>(keys[i], null);
+                }
+
+                packed = ArrayPool<byte>.Shared.Rent(Math.Max(totalLength, 1));
+                int offset = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    Buffer.BlockCopy(keys[i], 0, packed, offset, lengths[i]);
+                    offset += lengths[i];
+                }
+
+                var visitor = new ByteArrayResultVisitor(keys, results);
+                MultiGet(packed.AsSpan(0, totalLength), lengths.AsSpan(0, count), ref visitor, cf, readOptions);
+                return results;
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(lengths);
+                if (packed is object)
+                {
+                    ArrayPool<byte>.Shared.Return(packed);
+                }
+            }
+        }
+
+        /// <inheritdoc cref="MultiGetBatched(byte[][], ColumnFamilyHandle, ReadOptions)"/>
+        private KeyValuePair<string, string>[] MultiGetBatched(string[] keys, ColumnFamilyHandle cf, ReadOptions readOptions, Encoding encoding)
+        {
+            int count = keys.Length;
+            var results = new KeyValuePair<string, string>[count];
+            if (count == 0)
+            {
+                return results;
+            }
+
+            int[] lengths = ArrayPool<int>.Shared.Rent(count);
+            byte[] packed = null;
+            try
+            {
+                int totalLength = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    lengths[i] = encoding.GetByteCount(keys[i]);
+                    totalLength = checked(totalLength + lengths[i]);
+                    results[i] = new KeyValuePair<string, string>(keys[i], null);
+                }
+
+                packed = ArrayPool<byte>.Shared.Rent(Math.Max(totalLength, 1));
+                int offset = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    offset += encoding.GetBytes(keys[i], 0, keys[i].Length, packed, offset);
+                }
+
+                var visitor = new StringResultVisitor(keys, results, encoding);
+                MultiGet(packed.AsSpan(0, totalLength), lengths.AsSpan(0, count), ref visitor, cf, readOptions);
+                return results;
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(lengths);
+                if (packed is object)
+                {
+                    ArrayPool<byte>.Shared.Return(packed);
+                }
+            }
+        }
+
+        private readonly struct ByteArrayResultVisitor : IMultiGetValueVisitor
+        {
+            private readonly byte[][] _keys;
+            private readonly KeyValuePair<byte[], byte[]>[] _results;
+
+            public ByteArrayResultVisitor(byte[][] keys, KeyValuePair<byte[], byte[]>[] results)
+            {
+                _keys = keys;
+                _results = results;
+            }
+
+            public void OnValue(int index, ReadOnlySpan<byte> value)
+                => _results[index] = new KeyValuePair<byte[], byte[]>(_keys[index], value.ToArray());
+        }
+
+        private readonly struct StringResultVisitor : IMultiGetValueVisitor
+        {
+            private readonly string[] _keys;
+            private readonly KeyValuePair<string, string>[] _results;
+            private readonly Encoding _encoding;
+
+            public StringResultVisitor(string[] keys, KeyValuePair<string, string>[] results, Encoding encoding)
+            {
+                _keys = keys;
+                _results = results;
+                _encoding = encoding;
+            }
+
+            public void OnValue(int index, ReadOnlySpan<byte> value)
+                => _results[index] = new KeyValuePair<string, string>(_keys[index], _encoding.GetString(value));
         }
 
         /// <summary>

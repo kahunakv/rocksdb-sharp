@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
@@ -91,14 +92,30 @@ namespace RocksDbSharp
 
                 long start = Math.Max(0, fs.Length - tailBytes);
                 fs.Seek(start, SeekOrigin.Begin);
-                var buffer = new byte[64 * 1024];
-                int read;
-                while ((read = await fs.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false)) > 0)
+
+                // Rented, and returned only after the last read completed: every hashed file would otherwise
+                // allocate a new 64 KiB buffer. Each call rents its own, so concurrent calls never share one.
+                const int ReadBufferSize = 64 * 1024;
+                byte[] buffer = ArrayPool<byte>.Shared.Rent(ReadBufferSize);
+                try
                 {
-                    sha.TransformBlock(buffer, 0, read, null, 0);
+                    int read;
+                    while ((read = await fs.ReadAsync(buffer, 0, ReadBufferSize, cancellationToken).ConfigureAwait(false)) > 0)
+                    {
+                        sha.TransformBlock(buffer, 0, read, null, 0);
+                    }
                 }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+
                 sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+#if NET5_0_OR_GREATER
+                return Convert.ToHexString(sha.Hash);
+#else
                 return BitConverter.ToString(sha.Hash).Replace("-", string.Empty);
+#endif
             }
         }
 

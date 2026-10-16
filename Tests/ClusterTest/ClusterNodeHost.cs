@@ -284,7 +284,12 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                     Node.HandleObservedLeader(batch.LeaderId, batch.LeaderTerm);
                     if (batch.EntryTerm > 0)
                         _state!.RecordTermRange(batch.SequenceNumber, batch.EntryTerm);
-                    consumer.IngestBatch(batch.SequenceNumber, batch.Data);
+                    foreach (var (termStartSeq, term) in batch.TermChanges)
+                        _state!.RecordTermRange(termStartSeq, term);
+                    // The message is a run of the leader's batches merged
+                    // into one; a single write applies it at the same
+                    // sequence numbers the leader assigned.
+                    consumer.IngestChunk(batch.Data);
                     batch.ReturnToPool();
                 }
             }

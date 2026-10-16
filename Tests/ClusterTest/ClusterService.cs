@@ -161,14 +161,18 @@ public class ClusterService : ServiceBase<IClusterService>, IClusterService
     public async Task<ServerStreamingResult<ClusterBatchData>> SyncUpdatesAsync(SyncUpdatesRequest req)
     {
         var stream = GetServerStreamingContext<ClusterBatchData>();
-        var src = new ReplicationSource(_host.Db);
-
-        ulong currentSeq = req.StartSeq;
         var ct = Context.CallContext.CancellationToken;
+        var db = _host.Db;
+
+        // One tailer for the whole stream. Opening a log iterator per poll
+        // scans the current WAL file from its start every time; the tailer
+        // keeps its iterator, and merges runs of batches into one chunk, so
+        // the follower gets one message and does one write per chunk.
+        using var tailer = new ReplicationSource(db).TailWal(req.StartSeq);
 
         while (!ct.IsCancellationRequested)
         {
-            if (_host.IsResyncing) break;
+            if (_host.IsResyncing || !ReferenceEquals(_host.Db, db)) break;
 
             // Read the term before the role: if the role still says Leader
             // afterwards, the term we read belongs to this leadership. A node
@@ -178,33 +182,64 @@ public class ClusterService : ServiceBase<IClusterService>, IClusterService
             long term = _host.Node.CurrentTerm;
             if (_host.Node.Role != RaftRole.Leader) break;
 
-            bool any = false;
-            ulong latest = _host.Db.GetLatestSequenceNumber();
-            if (currentSeq <= latest)
+            if (!tailer.TryReadChunk(out var chunk))
             {
-                foreach (var batch in src.GetPooledWalUpdates(currentSeq))
-                {
-                    any = true;
-                    await stream.WriteAsync(new ClusterBatchData
-                    {
-                        SequenceNumber = batch.SequenceNumber,
-                        Length = batch.Length,
-                        PooledData = batch.PooledData,
-                        LeaderTerm = term,
-                        EntryTerm = _host.Node.GetTermForSeq(batch.SequenceNumber),
-                        LeaderId = _host.Node.NodeId,
-                    });
-                    currentSeq = batch.SequenceNumber + 1;
-                    WriteBatch.ReturnPooledBytes(batch.PooledData);
-                }
-            }
-            if (!any)
-            {
-                try { await Task.Delay(50, ct); }
+                try { await tailer.WaitForUpdatesAsync(ct); }
                 catch (OperationCanceledException) { break; }
+                continue;
             }
+
+            // A chunk can span the start of a term, so the message carries
+            // every term that begins inside it, not only the first one.
+            ulong first = chunk.FirstSequenceNumber;
+            ulong last = chunk.NextSequenceNumber - 1;
+            long entryTerm = _host.Node.GetTermForSeq(first);
+
+            // The chunk points into the tailer's buffer, which the next
+            // TryReadChunk overwrites. WriteAsync serializes the message
+            // before it completes, and the loop awaits it first.
+            await stream.WriteAsync(new ClusterBatchData
+            {
+                SequenceNumber = first,
+                EntryCount = chunk.EntryCount,
+                Length = chunk.Length,
+                PooledData = chunk.Buffer,
+                LeaderTerm = term,
+                EntryTerm = entryTerm,
+                TermChanges = FindTermChanges(first, last, entryTerm),
+                LeaderId = _host.Node.NodeId,
+            });
         }
         return stream.Result();
+    }
+
+    /// <summary>
+    /// Finds the terms that start in (first, last]. Terms never decrease along
+    /// the log, so each start is found with a binary search over the term map.
+    /// </summary>
+    private (ulong StartSeq, long Term)[] FindTermChanges(ulong first, ulong last, long firstTerm)
+    {
+        long lastTerm = _host.Node.GetTermForSeq(last);
+        if (lastTerm == firstTerm) return Array.Empty<(ulong, long)>();
+
+        var changes = new System.Collections.Generic.List<(ulong, long)>();
+        ulong from = first;
+        long term = firstTerm;
+        while (term != lastTerm)
+        {
+            // The smallest sequence number after `from` whose term differs.
+            ulong lo = from + 1, hi = last;
+            while (lo < hi)
+            {
+                ulong mid = lo + (hi - lo) / 2;
+                if (_host.Node.GetTermForSeq(mid) != term) hi = mid;
+                else lo = mid + 1;
+            }
+            term = _host.Node.GetTermForSeq(lo);
+            changes.Add((lo, term));
+            from = lo;
+        }
+        return changes.ToArray();
     }
 
     public UnaryResult<bool> ReportLastSyncSequenceNumber(string nodeId, ulong seqNumber)

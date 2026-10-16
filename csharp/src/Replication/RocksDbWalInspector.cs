@@ -1,5 +1,6 @@
 ﻿#if !NETSTANDARD2_0
 using System;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
@@ -63,10 +64,13 @@ public static class RocksDbWalInspector
             FileAccess.Read,
             FileShare.ReadWrite | FileShare.Delete);
 
-        var block = new byte[BlockSize];
-        var logical = new MemoryStream();
+        // Only the write batch header of a logical record is ever read, so a fragmented record keeps just its
+        // first bytes instead of being assembled in full.
+        Span<byte> prefix = stackalloc byte[WriteBatchHeaderSize];
+        int prefixLength = 0;
         var haveFragmentedRecord = false;
 
+        byte[] block = ArrayPool<byte>.Shared.Rent(BlockSize);
         WalZstdState? zstd = null;
 
         try
@@ -139,11 +143,9 @@ public static class RocksDbWalInspector
                         case RecordType.FullType:
                         case RecordType.RecyclableFullType:
                         {
-                            byte[] logicalRecord = zstd == null
-                                ? payload.ToArray()
-                                : zstd.DecompressRecord(payload);
-
-                            ulong seq = TryReadWriteBatchSequence(logicalRecord);
+                            ulong seq = zstd == null
+                                ? TryReadWriteBatchSequence(payload)
+                                : TryReadWriteBatchSequence(zstd.DecompressRecord(payload));
                             if (seq != 0)
                                 return seq;
                             continue;
@@ -152,13 +154,8 @@ public static class RocksDbWalInspector
                         case RecordType.FirstType:
                         case RecordType.RecyclableFirstType:
                         {
-                            logical.SetLength(0);
-
-                            byte[] firstFragment = zstd == null
-                                ? payload.ToArray()
-                                : zstd.DecompressRecord(payload);
-
-                            logical.Write(firstFragment, 0, firstFragment.Length);
+                            prefixLength = 0;
+                            AppendPrefix(prefix, ref prefixLength, zstd == null ? payload : zstd.DecompressRecord(payload));
                             haveFragmentedRecord = true;
                             continue;
                         }
@@ -169,11 +166,9 @@ public static class RocksDbWalInspector
                             if (!haveFragmentedRecord)
                                 continue;
 
-                            byte[] midFragment = zstd == null
-                                ? payload.ToArray()
-                                : zstd.DecompressRecord(payload);
-
-                            logical.Write(midFragment, 0, midFragment.Length);
+                            // A compressed fragment is still decompressed, also past the prefix: the decompression
+                            // context continues across records.
+                            AppendPrefix(prefix, ref prefixLength, zstd == null ? payload : zstd.DecompressRecord(payload));
                             continue;
                         }
 
@@ -183,20 +178,14 @@ public static class RocksDbWalInspector
                             if (!haveFragmentedRecord)
                                 continue;
 
-                            byte[] lastFragment = zstd == null
-                                ? payload.ToArray()
-                                : zstd.DecompressRecord(payload);
-
-                            logical.Write(lastFragment, 0, lastFragment.Length);
+                            AppendPrefix(prefix, ref prefixLength, zstd == null ? payload : zstd.DecompressRecord(payload));
                             haveFragmentedRecord = false;
 
-                            ulong seq = TryReadWriteBatchSequence(
-                                logical.GetBuffer().AsSpan(0, checked((int)logical.Length)));
-
+                            ulong seq = TryReadWriteBatchSequence(prefix.Slice(0, prefixLength));
                             if (seq != 0)
                                 return seq;
 
-                            logical.SetLength(0);
+                            prefixLength = 0;
                             continue;
                         }
 
@@ -212,7 +201,19 @@ public static class RocksDbWalInspector
         finally
         {
             zstd?.Dispose();
+            ArrayPool<byte>.Shared.Return(block);
         }
+    }
+
+    /// <summary>Copies the start of <paramref name="fragment"/> into the prefix, until the prefix is full.</summary>
+    private static void AppendPrefix(Span<byte> prefix, ref int prefixLength, ReadOnlySpan<byte> fragment)
+    {
+        int count = Math.Min(prefix.Length - prefixLength, fragment.Length);
+        if (count <= 0)
+            return;
+
+        fragment.Slice(0, count).CopyTo(prefix.Slice(prefixLength));
+        prefixLength += count;
     }
 
     private static ulong TryReadWriteBatchSequence(ReadOnlySpan<byte> logicalRecord)

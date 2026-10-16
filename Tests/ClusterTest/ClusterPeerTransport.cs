@@ -34,7 +34,7 @@ internal sealed class ClusterPeerTransport : IPeerTransport, IDisposable
             var (_, client) = GetClient(peer);
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromSeconds(2));
-            var resp = await client.RequestVoteAsync(new RequestVoteRequest
+            var resp = await client.WithCancellationToken(cts.Token).RequestVoteAsync(new RequestVoteRequest
             {
                 Term = term,
                 CandidateId = candidateId,
@@ -51,7 +51,9 @@ internal sealed class ClusterPeerTransport : IPeerTransport, IDisposable
         try
         {
             var (_, client) = GetClient(peer);
-            var resp = await client.HeartbeatAsync(new HeartbeatRequest
+            // The cluster node cancels this token at its heartbeat deadline;
+            // passing it on ends the RPC instead of leaving it pending.
+            var resp = await client.WithCancellationToken(ct).HeartbeatAsync(new HeartbeatRequest
             {
                 Term = payload.Term,
                 LeaderId = payload.LeaderId,

@@ -238,8 +238,6 @@ namespace RocksDbSharp
             {
                 encoding = Encoding.UTF8;
             }
-            
-            IntPtr errptr;
 
             unsafe
             {
@@ -247,29 +245,24 @@ namespace RocksDbSharp
                 {
                     int klength = key.Length;
                     int bklength = encoding.GetByteCount(k, klength);
-                    var buffer = Marshal.AllocHGlobal(bklength);
-                    byte* bk = (byte*)buffer.ToPointer();
+                    byte* stack = stackalloc byte[EncodeScratch.StackBytes(bklength)];
+                    using var scratch = new EncodeScratch(stack, bklength);
+                    byte* bk = scratch.Pointer;
                     encoding.GetBytes(k, klength, bk, bklength);
-                    UIntPtr sklength = (UIntPtr)bklength;
 
-                    var resultPtr = cf is null
-                        ? rocksdb_get(db, read_options, bk, sklength, out UIntPtr bvlength, out errptr)
-                        : rocksdb_get_cf(db, read_options, cf.Handle, bk, sklength, out bvlength, out errptr);
-      
-                    Marshal.FreeHGlobal(buffer);
-
+                    // The pinned read finds the value without copying it; only its existence is needed.
+                    IntPtr pinned = GetPinned(db, read_options, bk, (UIntPtr)bklength, cf, out IntPtr errptr);
                     if (errptr != IntPtr.Zero)
                     {
                         ThrowRocksDbException(errptr); return default; //Won't be reached
                     }
 
-                    if (resultPtr == IntPtr.Zero)
+                    if (pinned == IntPtr.Zero)
                     {
                         return false;
                     }
 
-                    rocksdb_free(resultPtr);
-
+                    rocksdb_pinnableslice_destroy(pinned);
                     return true;
                 }
             }
@@ -370,14 +363,7 @@ namespace RocksDbSharp
 
             IntPtr[] errptrs = new IntPtr[keys.Length];
             var result = rocksdb_multi_get(db, read_options, keys, cf: cf, errptrs: errptrs, encoding: encoding);
-            foreach (var errptr in errptrs)
-            {
-                if (errptr != IntPtr.Zero)
-                {
-                    ThrowRocksDbException(errptr); return default; //Won't be reached
-                }
-            }
-
+            ThrowFirstMultiGetError(errptrs);
             return result;
         }
 
@@ -391,15 +377,39 @@ namespace RocksDbSharp
         {
             IntPtr[] errptrs = new IntPtr[keys.Length];
             var result = rocksdb_multi_get(db, read_options, keys, keyLengths: keyLengths, cf: cf, errptrs: errptrs);
-            foreach (var errptr in errptrs)
+            ThrowFirstMultiGetError(errptrs);
+            return result;
+        }
+
+        /// <summary>
+        /// Throws the first error of a multi_get, and frees the other error strings, which nothing else reads.
+        /// </summary>
+        private void ThrowFirstMultiGetError(IntPtr[] errptrs)
+        {
+            IntPtr first = IntPtr.Zero;
+            for (int i = 0; i < errptrs.Length; i++)
             {
-                if (errptr != IntPtr.Zero)
+                IntPtr errptr = errptrs[i];
+                if (errptr == IntPtr.Zero)
                 {
-                    ThrowRocksDbException(errptr); return default; //Won't be reached
+                    continue;
+                }
+
+                errptrs[i] = IntPtr.Zero;
+                if (first == IntPtr.Zero)
+                {
+                    first = errptr;
+                }
+                else
+                {
+                    rocksdb_free(errptr);
                 }
             }
 
-            return result;
+            if (first != IntPtr.Zero)
+            {
+                ThrowRocksDbException(first);
+            }
         }
 
         public void rocksdb_delete(

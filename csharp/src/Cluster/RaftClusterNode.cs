@@ -38,6 +38,10 @@ public sealed class RaftClusterNode : IDisposable
     private readonly ElectionTimer _electionTimer;
     private readonly object _gate = new();
     private readonly Dictionary<string, PeerState> _peers;
+    private readonly IReadOnlyCollection<PeerState> _peerList;
+    // Scratch space for the commit calculation: one match sequence per peer
+    // plus self. Only used under _gate.
+    private readonly ulong[] _matchSeqScratch;
     private readonly CancellationTokenSource _cts = new();
 
     private RaftRole _role;
@@ -70,6 +74,10 @@ public sealed class RaftClusterNode : IDisposable
         _peers = _config.Peers.ToDictionary(
             p => p.NodeId,
             p => new PeerState(p, db.GetLatestSequenceNumber() + 1));
+        // The membership is fixed for the life of the node, so one read-only
+        // view serves every caller of Peers.
+        _peerList = Array.AsReadOnly(_peers.Values.ToArray());
+        _matchSeqScratch = new ulong[_peers.Count + 1];
 
         _electionTimer = new ElectionTimer(_config.ElectionTimeoutMinMs, _config.ElectionTimeoutMaxMs, OnElectionTimeout);
 
@@ -97,7 +105,7 @@ public sealed class RaftClusterNode : IDisposable
     public string? CurrentLeaderId { get { lock (_gate) return _currentLeaderId; } }
     public ClusterMode Mode => _state.Mode;
     public ulong CommitSeq => Volatile.Read(ref _commitSeq);
-    public IReadOnlyCollection<PeerState> Peers => _peers.Values.ToList();
+    public IReadOnlyCollection<PeerState> Peers => _peerList;
     public bool IsResyncing { get { lock (_gate) return _resyncing; } }
     public int BootstrapInSyncCount => Volatile.Read(ref _bootstrapInSyncFollowers);
 
@@ -336,13 +344,17 @@ public sealed class RaftClusterNode : IDisposable
     private void TryAdvanceCommitLocked()
     {
         if (_role != RaftRole.Leader) return;
-        // sort matchSeqs descending; quorum-th value is the new commitIndex
-        var seqs = _peers.Values.Select(p => p.MatchSeq).ToList();
-        seqs.Add(_db.GetLatestSequenceNumber()); // include self
-        seqs.Sort((a, b) => b.CompareTo(a));
+        // The quorum-th highest match sequence is the new commit index. The
+        // scratch array is reused, so this runs on every progress report
+        // without allocating while the lock is held.
+        var seqs = _matchSeqScratch;
+        int n = 0;
+        foreach (var p in _peers.Values) seqs[n++] = p.MatchSeq;
+        seqs[n++] = _db.GetLatestSequenceNumber(); // include self
         int q = _config.Quorum;
-        if (seqs.Count < q) return;
-        ulong candidate = seqs[q - 1];
+        if (n < q) return;
+        Array.Sort(seqs, 0, n);
+        ulong candidate = seqs[n - q]; // ascending order: the q-th highest
         if (candidate <= _commitSeq) return;
         // §5.4.2: a leader may only commit entries from its own term by
         // counting replicas; entries from earlier terms become committed
@@ -444,6 +456,12 @@ public sealed class RaftClusterNode : IDisposable
 
                 foreach (var peer in _peers.Values)
                 {
+                    // At most one heartbeat per peer is in flight. A peer that
+                    // answers slower than the interval is skipped until its
+                    // previous heartbeat finishes or times out; the other
+                    // peers are not held up by it.
+                    if (!peer.TryBeginHeartbeat()) continue;
+
                     ulong prevLogSeq = peer.NextSeq > 0 ? peer.NextSeq - 1 : 0;
                     long prevLogTerm = _state.Terms.GetTermForSeq(prevLogSeq);
                     var beat = new HeartbeatPayload(term, _config.NodeId, prevLogSeq, prevLogTerm, commit, leaderMode);
@@ -458,9 +476,26 @@ public sealed class RaftClusterNode : IDisposable
 
     private async Task SendHeartbeatToPeerAsync(PeerState peer, HeartbeatPayload beat, CancellationToken ct)
     {
+        // A heartbeat that is not answered within the shortest election
+        // timeout is useless: by then the follower may start an election. The
+        // deadline also bounds how long this peer's heartbeat slot stays taken.
+        using var rpcCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        rpcCts.CancelAfter(_config.ElectionTimeoutMinMs);
         try
         {
-            var resp = await _transport.SendHeartbeatAsync(peer.Member, beat, ct).ConfigureAwait(false);
+            var call = _transport.SendHeartbeatAsync(peer.Member, beat, rpcCts.Token);
+            // A transport that ignores the token still cannot keep the slot
+            // past the deadline.
+            var deadline = Task.Delay(Timeout.Infinite, rpcCts.Token);
+            if (await Task.WhenAny(call, deadline).ConfigureAwait(false) != call)
+            {
+                ObserveFault(call);
+                // A cancelled leadership is not evidence against the peer.
+                if (!ct.IsCancellationRequested) peer.OnAppendFailed();
+                return;
+            }
+
+            var resp = await call.ConfigureAwait(false);
             if (resp == null)
             {
                 peer.OnAppendFailed();
@@ -482,6 +517,9 @@ public sealed class RaftClusterNode : IDisposable
             {
                 lock (_gate)
                 {
+                    // A late answer to a heartbeat from an earlier leadership
+                    // must not count as progress in this one.
+                    if (_role != RaftRole.Leader || _state.CurrentTerm != beat.Term) return;
                     // Only the prefix ending at PrevLogSeq has been validated
                     // against our log. Anything past it is confirmed by the
                     // WAL-stream progress reports, not by the heartbeat.
@@ -492,8 +530,12 @@ public sealed class RaftClusterNode : IDisposable
             }
             else if (resp.Reason == "behind")
             {
-                // The follower's log is shorter; probe at its tip next time.
-                peer.RewindOnConflict(Math.Max(1, resp.LastSeq + 1));
+                lock (_gate)
+                {
+                    if (_role != RaftRole.Leader || _state.CurrentTerm != beat.Term) return;
+                    // The follower's log is shorter; probe at its tip next time.
+                    peer.RewindOnConflict(Math.Max(1, resp.LastSeq + 1));
+                }
             }
             else
             {
@@ -503,6 +545,21 @@ public sealed class RaftClusterNode : IDisposable
             }
         }
         catch { peer.OnAppendFailed(); }
+        finally
+        {
+            // Completes the deadline task when the call finished first.
+            rpcCts.Cancel();
+            peer.EndHeartbeat();
+        }
+    }
+
+    private static void ObserveFault(Task task)
+    {
+        _ = task.ContinueWith(
+            t => _ = t.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     private void OnElectionTimeout()

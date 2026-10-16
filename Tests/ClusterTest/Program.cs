@@ -587,8 +587,11 @@ internal sealed class Coordinator
     // Unix signal helpers (no-ops on Windows; tests fall back to kill)
     // -----------------------------------------------------------------------
 
-    private static bool StopProcess(Process p) => SendUnixSignal(p, 19); // SIGSTOP
-    private static bool ContinueProcess(Process p) => SendUnixSignal(p, 18); // SIGCONT
+    // The signal numbers differ: Linux has SIGSTOP=19 and SIGCONT=18, while
+    // macOS (BSD) has SIGSTOP=17 and SIGCONT=19. Sending 19 on macOS resumed
+    // the process instead of freezing it, so the hang scenario never hung.
+    private static bool StopProcess(Process p) => SendUnixSignal(p, OperatingSystem.IsMacOS() ? 17 : 19); // SIGSTOP
+    private static bool ContinueProcess(Process p) => SendUnixSignal(p, OperatingSystem.IsMacOS() ? 19 : 18); // SIGCONT
 
     private static bool SendUnixSignal(Process p, int signal)
     {
